@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Todoist Roll-Forward
-Moves tasks with a do date of yesterday to today, preserving recurrence and leaving deadlines untouched.
+Moves tasks with a do date of today to tomorrow, preserving recurrence and leaving deadlines untouched.
+Runs nightly so tomorrow's list is ready when you wake up.
 """
 
 import json
@@ -17,14 +18,14 @@ if not TOKEN:
     sys.exit(1)
 
 today = datetime.date.today().isoformat()
-yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
 
-# /api/v1/tasks/filter with query=date:yesterday targets the do date field only.
-# query=due:yesterday would also match tasks whose *deadline* is yesterday — we never want those.
+# /api/v1/tasks/filter with query=date:today targets the do date field only.
+# query=due:today would also match tasks whose *deadline* is today — we never want those.
 result = subprocess.run(
     ["curl", "-s", "-G",
      "https://api.todoist.com/api/v1/tasks/filter",
-     "--data-urlencode", "query=date:yesterday",
+     "--data-urlencode", "query=date:today",
      "-H", f"Authorization: Bearer {TOKEN}"],
     capture_output=True, text=True
 )
@@ -37,7 +38,7 @@ except json.JSONDecodeError:
     sys.exit(1)
 
 if not tasks:
-    print(f"No tasks with do date of yesterday ({yesterday}) — nothing to roll forward.")
+    print(f"No tasks with do date of today ({today}) — nothing to roll forward.")
     sys.exit(0)
 
 # Build Sync API commands — one per task.
@@ -48,8 +49,8 @@ commands = []
 for task in tasks:
     due = task.get("due") or {}
     new_due = {
-        "date": today,
-        "string": due.get("string", today),
+        "date": tomorrow,
+        "string": due.get("string", tomorrow),
         "is_recurring": due.get("is_recurring", False),
         "lang": due.get("lang", "en"),
     }
@@ -85,7 +86,7 @@ for task, cmd in zip(tasks, commands):
     else:
         errors.append(f"{task['content']} (status: {status})")
 
-print(f"Rolled forward {len(updated)} task(s) to {today}: {updated}")
+print(f"Rolled forward {len(updated)} task(s) to {tomorrow}: {updated}")
 if errors:
     print(f"Errors on {len(errors)} task(s): {errors}")
     sys.exit(1)

@@ -2,7 +2,7 @@ name: Roll Forward Tasks
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # 7 AM BST (UTC+1)
+    - cron: '0 22 * * *'  # 11 PM BST (UTC+1)
   workflow_dispatch:       # manual trigger from GitHub UI
 
 jobs:
