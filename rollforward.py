@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Todoist Roll-Forward
-Moves tasks with a do date of today to tomorrow, preserving recurrence and leaving deadlines untouched.
-Runs nightly so tomorrow's list is ready when you wake up.
+Moves tasks with a do date of yesterday to tomorrow, preserving recurrence and leaving deadlines untouched.
+Runs nightly at 12:02 AM WET so tomorrow's list is ready when you wake up.
 """
 
 import json
@@ -20,26 +20,38 @@ if not TOKEN:
 today = datetime.date.today().isoformat()
 tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
 
-# /api/v1/tasks/filter with query=date:today targets the do date field only.
-# query=due:today would also match tasks whose *deadline* is today — we never want those.
-result = subprocess.run(
-    ["curl", "-s", "-G",
-     "https://api.todoist.com/api/v1/tasks/filter",
-     "--data-urlencode", "query=date:today",
-     "-H", f"Authorization: Bearer {TOKEN}"],
-    capture_output=True, text=True
-)
+# Fetch all pages of tasks with do date of yesterday.
+# Todoist evaluates "yesterday" relative to the user's timezone, so at 12:02 AM WET it
+# correctly matches tasks from the day that just ended.
+# query=due:yesterday would also match tasks whose *deadline* is yesterday — we never want those.
+def fetch_tasks_page(cursor=None):
+    args = ["curl", "-s", "-G",
+            "https://api.todoist.com/api/v1/tasks/filter",
+            "--data-urlencode", "query=date:yesterday",
+            "-H", f"Authorization: Bearer {TOKEN}"]
+    if cursor:
+        args += ["--data-urlencode", f"cursor={cursor}"]
+    result = subprocess.run(args, capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(f"ERROR: Unexpected API response: {result.stdout[:200]}", file=sys.stderr)
+        sys.exit(1)
 
-try:
-    data = json.loads(result.stdout)
-    tasks = data.get("results", [])
-except json.JSONDecodeError:
-    print(f"ERROR: Unexpected API response: {result.stdout[:200]}", file=sys.stderr)
-    sys.exit(1)
+tasks = []
+cursor = None
+while True:
+    data = fetch_tasks_page(cursor)
+    tasks.extend(data.get("results", []))
+    cursor = data.get("next_cursor")
+    if not cursor:
+        break
 
 if not tasks:
-    print(f"No tasks with do date of today ({today}) — nothing to roll forward.")
+    print(f"No tasks with do date of yesterday — nothing to roll forward.")
     sys.exit(0)
+
+print(f"Found {len(tasks)} task(s) to roll forward.")
 
 # Build Sync API commands — one per task.
 # We preserve the full due object (string, is_recurring, lang, timezone) and only update date.
