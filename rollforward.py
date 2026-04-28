@@ -17,17 +17,19 @@ if not TOKEN:
     print("ERROR: TODOIST_API_TOKEN environment variable not set.", file=sys.stderr)
     sys.exit(1)
 
-today = datetime.date.today().isoformat()
-tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+# At 23:02 UTC (= 12:02 AM WET/WEST), UTC "today" equals WET "yesterday".
+# Using the explicit date avoids pulling in the entire overdue backlog.
+wet_yesterday = datetime.date.today().isoformat()
+wet_today = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
 
-# Fetch all pages of tasks with do date of yesterday.
-# Todoist evaluates "yesterday" relative to the user's timezone, so at 12:02 AM WET it
-# correctly matches tasks from the day that just ended.
-# query=due:yesterday would also match tasks whose *deadline* is yesterday — we never want those.
+# Fetch all pages of tasks scheduled for exactly yesterday (WET).
+# Using an explicit date instead of "yesterday" ensures we only get tasks
+# assigned for that specific day, not the entire overdue backlog.
+# Using "date:" (not "due:") avoids matching tasks whose only deadline falls on that day.
 def fetch_tasks_page(cursor=None):
     args = ["curl", "-s", "-G",
             "https://api.todoist.com/api/v1/tasks/filter",
-            "--data-urlencode", "query=date:yesterday",
+            "--data-urlencode", f"query=date:{wet_yesterday}",
             "-H", f"Authorization: Bearer {TOKEN}"]
     if cursor:
         args += ["--data-urlencode", f"cursor={cursor}"]
@@ -48,10 +50,10 @@ while True:
         break
 
 if not tasks:
-    print(f"No tasks with do date of yesterday — nothing to roll forward.")
+    print(f"No tasks scheduled for {wet_yesterday} — nothing to roll forward.")
     sys.exit(0)
 
-print(f"Found {len(tasks)} task(s) to roll forward.")
+print(f"Found {len(tasks)} task(s) scheduled for {wet_yesterday} to roll forward.")
 
 # Build Sync API commands — one per task.
 # We preserve the full due object (string, is_recurring, lang, timezone) and only update date.
@@ -61,8 +63,8 @@ commands = []
 for task in tasks:
     due = task.get("due") or {}
     new_due = {
-        "date": tomorrow,
-        "string": due.get("string", tomorrow),
+        "date": wet_today,
+        "string": due.get("string", wet_today),
         "is_recurring": due.get("is_recurring", False),
         "lang": due.get("lang", "en"),
     }
@@ -98,7 +100,7 @@ for task, cmd in zip(tasks, commands):
     else:
         errors.append(f"{task['content']} (status: {status})")
 
-print(f"Rolled forward {len(updated)} task(s) to {tomorrow}: {updated}")
+print(f"Rolled forward {len(updated)} task(s) to {wet_today}: {updated}")
 if errors:
     print(f"Errors on {len(errors)} task(s): {errors}")
     sys.exit(1)
