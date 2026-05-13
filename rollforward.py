@@ -19,8 +19,47 @@ if not TOKEN:
 
 # At 23:02 UTC (= 12:02 AM WET/WEST), UTC "today" equals WET "yesterday".
 # Using the explicit date avoids pulling in the entire overdue backlog.
-wet_yesterday = datetime.date.today().isoformat()
-wet_today = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+wet_yesterday_date = datetime.date.today()
+wet_yesterday = wet_yesterday_date.isoformat()
+wet_today = (wet_yesterday_date + datetime.timedelta(days=1)).isoformat()
+wet_monday = (wet_yesterday_date + datetime.timedelta(days=3)).isoformat()
+wet_saturday = (wet_yesterday_date + datetime.timedelta(days=6)).isoformat()
+
+is_friday_rollover = (wet_yesterday_date.weekday() == 4)  # 4 = Friday
+is_sunday_rollover = (wet_yesterday_date.weekday() == 6)  # 6 = Sunday
+
+def fetch_projects():
+    result = subprocess.run(
+        ["curl", "-s", "https://api.todoist.com/api/v1/projects",
+         "-H", f"Authorization: Bearer {TOKEN}"],
+        capture_output=True, text=True
+    )
+    try:
+        data = json.loads(result.stdout)
+        return data.get("results", data) if isinstance(data, dict) else data
+    except json.JSONDecodeError:
+        print(f"ERROR: Could not fetch projects: {result.stdout[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+def collect_work_project_ids(projects):
+    """Return IDs of the #work project and all its sub-projects (any depth)."""
+    root_ids = {p["id"] for p in projects if p.get("name", "").lower() == "work"}
+    if not root_ids:
+        return set()
+    all_ids = set(root_ids)
+    frontier = set(root_ids)
+    while frontier:
+        children = {p["id"] for p in projects if p.get("parent_id") in frontier}
+        new_children = children - all_ids
+        all_ids |= new_children
+        frontier = new_children
+    return all_ids
+
+work_project_ids = collect_work_project_ids(fetch_projects()) if is_friday_rollover else set()
+if is_friday_rollover:
+    print(f"Friday rollover: work project IDs found: {len(work_project_ids)}")
+if is_sunday_rollover:
+    print(f"Sunday rollover: @weekend tasks with no priority will roll to {wet_saturday}.")
 
 # Fetch all pages of tasks scheduled for exactly yesterday (WET).
 # Using an explicit date instead of "yesterday" ensures we only get tasks
@@ -62,9 +101,18 @@ print(f"Found {len(tasks)} task(s) scheduled for {wet_yesterday} to roll forward
 commands = []
 for task in tasks:
     due = task.get("due") or {}
+    has_no_priority = task.get("priority", 1) == 1
+    is_work_task = task.get("project_id") in work_project_ids
+    is_weekend_tagged = "weekend" in task.get("labels", [])
+    if is_friday_rollover and is_work_task and has_no_priority:
+        target_date = wet_monday
+    elif is_sunday_rollover and is_weekend_tagged and has_no_priority:
+        target_date = wet_saturday
+    else:
+        target_date = wet_today
     new_due = {
-        "date": wet_today,
-        "string": due.get("string", wet_today),
+        "date": target_date,
+        "string": due.get("string", target_date),
         "is_recurring": due.get("is_recurring", False),
         "lang": due.get("lang", "en"),
     }
@@ -76,20 +124,23 @@ for task in tasks:
         "args": {"id": task["id"], "due": new_due},
     })
 
-r = subprocess.run(
-    ["curl", "-s", "-X", "POST",
-     "https://api.todoist.com/api/v1/sync",
-     "-H", f"Authorization: Bearer {TOKEN}",
-     "-H", "Content-Type: application/json",
-     "-d", json.dumps({"commands": commands})],
-    capture_output=True, text=True
-)
-
-try:
-    sync_status = json.loads(r.stdout).get("sync_status", {})
-except json.JSONDecodeError:
-    print(f"ERROR: Unexpected sync response: {r.stdout[:200]}", file=sys.stderr)
-    sys.exit(1)
+BATCH_SIZE = 100
+sync_status = {}
+for i in range(0, len(commands), BATCH_SIZE):
+    batch = commands[i:i + BATCH_SIZE]
+    r = subprocess.run(
+        ["curl", "-s", "-X", "POST",
+         "https://api.todoist.com/api/v1/sync",
+         "-H", f"Authorization: Bearer {TOKEN}",
+         "-H", "Content-Type: application/json",
+         "-d", json.dumps({"commands": batch})],
+        capture_output=True, text=True
+    )
+    try:
+        sync_status.update(json.loads(r.stdout).get("sync_status", {}))
+    except json.JSONDecodeError:
+        print(f"ERROR: Unexpected sync response: {r.stdout[:200]}", file=sys.stderr)
+        sys.exit(1)
 
 updated = []
 errors = []
@@ -100,7 +151,7 @@ for task, cmd in zip(tasks, commands):
     else:
         errors.append(f"{task['content']} (status: {status})")
 
-print(f"Rolled forward {len(updated)} task(s) to {wet_today}: {updated}")
+print(f"Rolled forward {len(updated)} task(s): {updated}")
 if errors:
     print(f"Errors on {len(errors)} task(s): {errors}")
     sys.exit(1)
