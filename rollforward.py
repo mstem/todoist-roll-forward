@@ -29,17 +29,26 @@ is_friday_rollover = (wet_yesterday_date.weekday() == 4)  # 4 = Friday
 is_sunday_rollover = (wet_yesterday_date.weekday() == 6)  # 6 = Sunday
 
 def fetch_projects():
-    result = subprocess.run(
-        ["curl", "-s", "https://api.todoist.com/api/v1/projects",
-         "-H", f"Authorization: Bearer {TOKEN}"],
-        capture_output=True, text=True
-    )
-    try:
-        data = json.loads(result.stdout)
-        return data.get("results", data) if isinstance(data, dict) else data
-    except json.JSONDecodeError:
-        print(f"ERROR: Could not fetch projects: {result.stdout[:200]}", file=sys.stderr)
-        sys.exit(1)
+    projects = []
+    cursor = None
+    while True:
+        args = ["curl", "-s", "-G", "https://api.todoist.com/api/v1/projects",
+                "-H", f"Authorization: Bearer {TOKEN}"]
+        if cursor:
+            args += ["--data-urlencode", f"cursor={cursor}"]
+        result = subprocess.run(args, capture_output=True, text=True)
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            print(f"ERROR: Could not fetch projects: {result.stdout[:200]}", file=sys.stderr)
+            sys.exit(1)
+        page = data.get("results", data) if isinstance(data, dict) else data
+        if isinstance(page, list):
+            projects.extend(page)
+        cursor = data.get("next_cursor") if isinstance(data, dict) else None
+        if not cursor:
+            break
+    return projects
 
 def collect_work_project_ids(projects):
     """Return IDs of the #work project and all its sub-projects (any depth)."""
@@ -104,7 +113,7 @@ for task in tasks:
     has_no_priority = task.get("priority", 1) == 1
     is_work_task = task.get("project_id") in work_project_ids
     is_weekend_tagged = "weekend" in task.get("labels", [])
-    if is_friday_rollover and is_work_task and has_no_priority:
+    if is_friday_rollover and is_work_task:
         target_date = wet_monday
     elif is_sunday_rollover and is_weekend_tagged and has_no_priority:
         target_date = wet_saturday
