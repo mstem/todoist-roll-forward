@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Blocks commits that stage env/secrets files or add likely API keys/tokens.
+# Bypass (only if you're sure): git commit --no-verify
+set -euo pipefail
+
+blocked=0
+
+# 1. Refuse to stage anything that looks like an env/secrets file.
+while IFS= read -r file; do
+  case "$file" in
+    .env|.env.*|*.env|secrets.env|secrets.*.env)
+      case "$file" in
+        *.env.example|*.env.sample|*.env.template) ;; # templates are fine
+        *)
+          echo "pre-commit: refusing to commit env/secrets file: $file" >&2
+          blocked=1
+          ;;
+      esac
+      ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACM)
+
+# 2. Scan staged additions for likely secrets (API keys/tokens/passwords).
+pattern='sk-ant-[A-Za-z0-9_-]{20,}|(api[_-]?key|token|secret|password)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_/+-]{16,}'
+
+matches=$(git diff --cached -U0 --diff-filter=ACM -- . ':(exclude).githooks/pre-commit' \
+  | grep -E '^\+' | grep -vE '^\+\+\+' \
+  | grep -EIi "$pattern" || true)
+
+if [ -n "$matches" ]; then
+  echo "pre-commit: possible secret detected in staged changes:" >&2
+  echo "$matches" | sed 's/^/  /' >&2
+  blocked=1
+fi
+
+if [ "$blocked" -ne 0 ]; then
+  echo "" >&2
+  echo "Commit blocked. If this is a false positive: git commit --no-verify" >&2
+  exit 1
+fi
+
+exit 0

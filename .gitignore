@@ -4,3 +4,6 @@ secrets.env
 __pycache__/
 *.pyc
 .DS_Store
+.last-run
+roll-forward.log
+*.tgz
