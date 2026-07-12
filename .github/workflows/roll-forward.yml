@@ -2,7 +2,10 @@ name: Roll Forward Tasks
 
 on:
   schedule:
-    - cron: '2 23 * * *'  # 12:02 AM WET (UTC+1 summer / WEST)
+    - cron: '2 0 * * *'   # 00:02 UTC — safely after midnight in the Todoist account zone
+                          # (Europe/Rome, UTC+1/+2). GitHub may delay scheduled runs ~1h,
+                          # which is now harmless: the script anchors "today" to the
+                          # account timezone fetched from the Todoist API.
   workflow_dispatch:       # manual trigger from GitHub UI
 
 jobs:
