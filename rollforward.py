@@ -10,6 +10,11 @@ Scheduling rules for the target day:
     if today is Sat/Sun they roll to the upcoming Monday instead.
   * Unprioritised @weekend tasks are kept on weekends: on a weekday they roll to the
     upcoming Saturday rather than landing mid-week.
+  * A task pushed more than ROLLOVER_LIMIT times (Todoist's own postponed_count) stops
+    being rolled: it gets the @backlog label and its due date cleared, which takes it off
+    the today list and onto the Backlog page in todoist-triage. That is the same label
+    todoist-triage applies when a task is swiped to Backlog by hand, so both routes off
+    the today list land in the same place. Prioritised and recurring tasks are exempt.
 
 Pass --dry-run to print what would change without calling the Sync API.
 """
@@ -59,6 +64,18 @@ today_iso = today.isoformat()
 # today's list. In nightly steady state nothing should be more than a day or two behind.
 ROLL_BACK_DAYS = int(os.environ.get("ROLL_BACK_DAYS", "30"))
 cutoff_iso = (today - datetime.timedelta(days=ROLL_BACK_DAYS)).isoformat()
+
+# A task that has been pushed forward this many times is not a "today" task any more,
+# it is backlog. Past the limit it gets tagged and its due date dropped instead of being
+# moved again, so it leaves both this sweep and the Do-Today deck in todoist-triage, and
+# surfaces on that app's Backlog page instead.
+#
+# The count comes from Todoist's own `postponed_count` on each task, so there is no state
+# to keep between runs — which matters because this runs on a fresh GitHub Actions runner
+# every night with nothing writable to carry a counter in. It counts every postponement,
+# including ones made by hand in the Todoist app, not just this script's.
+ROLLOVER_LIMIT = int(os.environ.get("ROLLOVER_LIMIT", "21"))
+BACKLOG_LABEL = os.environ.get("BACKLOG_LABEL", "backlog")
 
 def upcoming(weekday, ref=None):
     """The given weekday (Mon=0 .. Sun=6) falling on or after `ref` (default today)."""
@@ -116,10 +133,10 @@ if today_is_weekend:
 # single exact date ensures nothing is ever stranded: a task added late for its own day,
 # or one that slipped more than a day behind, still gets caught and pulled forward.
 # "overdue" keys off the due date only, so deadline-only tasks are left untouched.
-def fetch_tasks_page(cursor=None):
+def fetch_tasks_page(query, cursor=None):
     args = ["curl", "-s", "-G",
             "https://api.todoist.com/api/v1/tasks/filter",
-            "--data-urlencode", "query=overdue",
+            "--data-urlencode", f"query={query}",
             "-H", f"Authorization: Bearer {TOKEN}"]
     if cursor:
         args += ["--data-urlencode", f"cursor={cursor}"]
@@ -130,30 +147,62 @@ def fetch_tasks_page(cursor=None):
         print(f"ERROR: Unexpected API response: {result.stdout[:200]}", file=sys.stderr)
         sys.exit(1)
 
-tasks = []
-cursor = None
-while True:
-    data = fetch_tasks_page(cursor)
-    tasks.extend(data.get("results", []))
-    cursor = data.get("next_cursor")
-    if not cursor:
-        break
+def fetch_tasks(query):
+    out = []
+    cursor = None
+    while True:
+        data = fetch_tasks_page(query, cursor)
+        out.extend(data.get("results", []))
+        cursor = data.get("next_cursor")
+        if not cursor:
+            break
+    return out
+
+overdue_tasks = fetch_tasks("overdue")
 
 # Drop tasks older than the look-back window (the due date may carry a time component,
 # e.g. "2026-01-07T19:00:00Z", so compare on the leading YYYY-MM-DD only).
 def due_date_of(task):
     return ((task.get("due") or {}).get("date") or "")[:10]
 
+# Tasks that have been pushed too many times are taken out before anything is rolled.
+# Two kinds are never auto-backlogged however high the count:
+#   * a prioritised task (p1/p2/p3) — the priority is an explicit "this one matters".
+#   * a recurring task — coming back repeatedly is the whole point of one, and its
+#     postponed_count climbs on every occurrence.
+def is_exempt(task):
+    return task.get("priority", 1) > 1 or (task.get("due") or {}).get("is_recurring", False)
+
+def postponed(task):
+    return task.get("postponed_count", 0) or 0
+
+# Candidates deliberately reach wider than the roll set does:
+#   * today's tasks as well as overdue ones, so a task on its 60th push is taken off the
+#     list today rather than the day after it next goes overdue.
+#   * tasks outside the ROLL_BACK_DAYS window too. Those are skipped by the roll for
+#     manual triage, and a task 200 days overdue on its 90th push is the clearest case
+#     there is of belonging on the Backlog page.
+candidates = {t["id"]: t for t in overdue_tasks}
+for t in fetch_tasks("date:today"):
+    candidates.setdefault(t["id"], t)
+
+stale = [t for t in candidates.values()
+         if postponed(t) > ROLLOVER_LIMIT
+         and BACKLOG_LABEL not in t.get("labels", [])
+         and not is_exempt(t)]
+stale_ids = {t["id"] for t in stale}
+
+if stale:
+    print(f"Auto-backlogging {len(stale)} task(s) pushed more than {ROLLOVER_LIMIT} times: "
+          f"tagging @{BACKLOG_LABEL} and clearing the due date.")
+
+tasks = [t for t in overdue_tasks if t["id"] not in stale_ids]
 total_overdue = len(tasks)
 tasks = [t for t in tasks if due_date_of(t) >= cutoff_iso]
 skipped = total_overdue - len(tasks)
 if skipped:
     print(f"Skipping {skipped} task(s) overdue before {cutoff_iso} "
           f"(older than ROLL_BACK_DAYS={ROLL_BACK_DAYS}); left in place for manual triage.")
-
-if not tasks:
-    print("No overdue tasks within the look-back window — nothing to roll forward.")
-    sys.exit(0)
 
 print(f"Found {len(tasks)} overdue task(s) to roll forward to {today_iso}.")
 
@@ -171,7 +220,18 @@ def target_for(task):
         return upcoming_saturday         # keep @weekend tasks on the weekend
     return today_iso
 
-commands = []
+# Two command lists, each paired with the tasks it came from, so the dry-run and the
+# result report can name the right task for every command.
+backlog_commands = []
+for task in stale:
+    labels = list(dict.fromkeys(task.get("labels", []) + [BACKLOG_LABEL]))
+    backlog_commands.append({
+        "type": "item_update",
+        "uuid": str(uuid.uuid4()),
+        "args": {"id": task["id"], "labels": labels, "due": None},
+    })
+
+roll_commands = []
 for task in tasks:
     due = task.get("due") or {}
     target_date = target_for(task)
@@ -183,19 +243,30 @@ for task in tasks:
     }
     if due.get("timezone"):
         new_due["timezone"] = due["timezone"]
-    commands.append({
+    roll_commands.append({
         "type": "item_update",
         "uuid": str(uuid.uuid4()),
         "args": {"id": task["id"], "due": new_due},
     })
 
+commands = backlog_commands + roll_commands
+if not commands:
+    print("Nothing to do.")
+    sys.exit(0)
+
 if DRY_RUN:
     from collections import Counter
-    by_target = Counter(c["args"]["due"]["date"] for c in commands)
-    print(f"[dry-run] would move {len(commands)} task(s):")
+    if stale:
+        print(f"[dry-run] would auto-backlog {len(stale)} task(s) "
+              f"(@{BACKLOG_LABEL}, due date cleared):")
+        for task in sorted(stale, key=lambda t: -postponed(t)):
+            print(f"[dry-run]   pushed {postponed(task):4d}x  "
+                  f"{due_date_of(task)}  {task['content'][:60]!r}")
+    by_target = Counter(c["args"]["due"]["date"] for c in roll_commands)
+    print(f"[dry-run] would move {len(roll_commands)} task(s):")
     for tgt, n in sorted(by_target.items()):
         print(f"[dry-run]   -> {tgt}: {n} task(s)")
-    for task, cmd in zip(tasks, commands):
+    for task, cmd in zip(tasks, roll_commands):
         old = (task.get("due") or {}).get("date")
         print(f"[dry-run]   {old} -> {cmd['args']['due']['date']}  {task['content'][:60]!r}")
     sys.exit(0)
@@ -219,14 +290,18 @@ for i in range(0, len(commands), BATCH_SIZE):
         sys.exit(1)
 
 updated = []
+backlogged = []
 errors = []
-for task, cmd in zip(tasks, commands):
+for task, cmd in list(zip(stale, backlog_commands)) + list(zip(tasks, roll_commands)):
     status = sync_status.get(cmd["uuid"], "unknown")
+    target = backlogged if cmd["args"].get("due") is None else updated
     if status == "ok":
-        updated.append(task["content"])
+        target.append(task["content"])
     else:
         errors.append(f"{task['content']} (status: {status})")
 
+if backlogged:
+    print(f"Auto-backlogged {len(backlogged)} task(s) past {ROLLOVER_LIMIT} pushes: {backlogged}")
 print(f"Rolled forward {len(updated)} task(s): {updated}")
 if errors:
     print(f"Errors on {len(errors)} task(s): {errors}")
