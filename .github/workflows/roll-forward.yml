@@ -1,13 +1,23 @@
 name: Roll Forward Tasks
 
+# This is no longer the primary runner. Since 2026-08-25 the sweep fires from root's
+# crontab on the Coolify box (91.98.23.69) at 01:15 UTC, via
+# /opt/todoist-roll-forward/run.sh, which pulls this repo before each run. That cron
+# fires on time and has no quota or inactivity rules attached to it.
+#
+# This workflow is left enabled as a backup, so the sweep still happens if the box is
+# down. Both firing is duplicated work rather than a conflict: whichever runs first
+# rolls the overdue tasks and backlogs anything past ROLLOVER_LIMIT, and the later one
+# finds nothing overdue and skips tasks already carrying the label.
 on:
   schedule:
     # Off-the-hour minutes on purpose. GitHub queues scheduled runs and drops them
     # when congested; :00-:02 is the worst slot. Observed on this repo: the 00:02
     # cron was delivered 1.7-3.7h late every night through August 2026, then 7.5h
-    # late on the 27th, then not at all on the 28th.
-    - cron: '37 1 * * *'   # ~01:37 UTC, after midnight in the account zone year-round
-    - cron: '23 8 * * *'   # retry: a no-op if the first run already swept today
+    # late on the 27th, then not at all on the 28th — which is why the host cron took
+    # over as primary.
+    - cron: '37 1 * * *'   # ~01:37 UTC, after the box's 01:15 run has swept
+    - cron: '23 8 * * *'   # retry: a no-op if either runner already swept today
   workflow_dispatch:       # manual trigger from GitHub UI
 
 jobs:
