@@ -2,10 +2,12 @@ name: Roll Forward Tasks
 
 on:
   schedule:
-    - cron: '2 0 * * *'   # 00:02 UTC — safely after midnight in the Todoist account zone
-                          # (Europe/Rome, UTC+1/+2). GitHub may delay scheduled runs ~1h,
-                          # which is now harmless: the script anchors "today" to the
-                          # account timezone fetched from the Todoist API.
+    # Off-the-hour minutes on purpose. GitHub queues scheduled runs and drops them
+    # when congested; :00-:02 is the worst slot. Observed on this repo: the 00:02
+    # cron was delivered 1.7-3.7h late every night through August 2026, then 7.5h
+    # late on the 27th, then not at all on the 28th.
+    - cron: '37 1 * * *'   # ~01:37 UTC, after midnight in the account zone year-round
+    - cron: '23 8 * * *'   # retry: a no-op if the first run already swept today
   workflow_dispatch:       # manual trigger from GitHub UI
 
 jobs:
