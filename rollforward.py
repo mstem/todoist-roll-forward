@@ -5,6 +5,10 @@ Moves overdue tasks (do date before today) forward to today, preserving recurren
 and leaving deadlines untouched. Runs nightly just after midnight Europe/Lisbon so
 today's list is ready when you wake up.
 
+Only tasks with no assignee, or assigned to this account, are touched: a filter query
+also returns tasks a collaborator has been assigned in a shared project, and those are
+theirs to reschedule. A time of day on the due date is carried across the move.
+
 Scheduling rules for the target day:
   * Work tasks (#work project + all sub-projects) are never scheduled onto a weekend:
     if today is Sat/Sun they roll to the upcoming Monday instead.
@@ -16,6 +20,10 @@ Scheduling rules for the target day:
     the today list and onto the Backlog page in todoist-triage. That is the same label
     todoist-triage applies when a task is swiped to Backlog by hand, so both routes off
     the today list land in the same place. Prioritised and recurring tasks are exempt.
+
+The label and project names the rules key off are checked against the account on every
+run. A rename in the Todoist app would otherwise switch a rule off in silence, so a miss
+is reported and fails the run once the roll itself has finished.
 
 Pass --dry-run to print what would change without calling the Sync API.
 """
@@ -42,7 +50,8 @@ DRY_RUN = "--dry-run" in sys.argv
 # datetime.date.today() used UTC, and the nightly GitHub Actions run is often delayed ~1h
 # past midnight UTC. Fetching the account zone keeps the target day correct regardless of
 # firing time, and self-corrects if the account timezone ever changes.
-def fetch_account_timezone():
+def fetch_account():
+    """Returns (timezone, own user id). The user id identifies which tasks are ours."""
     try:
         r = subprocess.run(
             ["curl", "-s", "-X", "POST", "https://api.todoist.com/api/v1/sync",
@@ -50,13 +59,14 @@ def fetch_account_timezone():
              "--data-urlencode", "sync_token=*",
              "--data-urlencode", 'resource_types=["user"]'],
             capture_output=True, text=True)
-        return ZoneInfo(json.loads(r.stdout)["user"]["tz_info"]["timezone"])
+        user = json.loads(r.stdout)["user"]
+        return ZoneInfo(user["tz_info"]["timezone"]), str(user["id"])
     except Exception as e:
-        print(f"WARNING: could not read account timezone ({e}); falling back to Europe/Lisbon.",
-              file=sys.stderr)
-        return ZoneInfo("Europe/Lisbon")
+        print(f"WARNING: could not read account details ({e}); falling back to Europe/Lisbon, "
+              "and every assigned task will be left alone.", file=sys.stderr)
+        return ZoneInfo("Europe/Lisbon"), None
 
-TZ = fetch_account_timezone()
+TZ, MY_UID = fetch_account()
 today = datetime.datetime.now(TZ).date()
 today_iso = today.isoformat()
 
@@ -77,6 +87,36 @@ cutoff_iso = (today - datetime.timedelta(days=ROLL_BACK_DAYS)).isoformat()
 # including ones made by hand in the Todoist app, not just this script's.
 ROLLOVER_LIMIT = int(os.environ.get("ROLLOVER_LIMIT", "21"))
 BACKLOG_LABEL = os.environ.get("BACKLOG_LABEL", "backlog")
+WEEKEND_LABEL = os.environ.get("WEEKEND_LABEL", "weekend")
+WORK_PROJECT = os.environ.get("WORK_PROJECT", "work")
+
+# Every scheduling rule here keys off a name typed into Todoist, so renaming the label or
+# the project in the app turns the matching rule off. Nothing errors when that happens:
+# the sweep keeps running and keeps reporting success while quietly scheduling weekend
+# tasks onto Tuesdays. So the names are checked against the account up front, matched
+# without case, and a miss is reported loudly and fails the run at the end (after the
+# roll, so a typo in a label never strands a day of tasks).
+config_errors = []
+
+def has_label(task, name):
+    return any(l.lower() == name.lower() for l in task.get("labels", []))
+
+def check_labels_exist():
+    r = subprocess.run(["curl", "-s", "-G", "https://api.todoist.com/api/v1/labels",
+                        "-H", f"Authorization: Bearer {TOKEN}"], capture_output=True, text=True)
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        config_errors.append(f"could not read the label list: {r.stdout[:120]}")
+        return
+    names = {l.get("name", "").lower() for l in (data.get("results", data) or [])}
+    for label in (WEEKEND_LABEL, BACKLOG_LABEL):
+        if label.lower() not in names:
+            config_errors.append(
+                f"no label named @{label} exists in Todoist, so the rule that depends on "
+                f"it does nothing (rename it back, or set the matching env var)")
+
+check_labels_exist()
 
 def upcoming(weekday, ref=None):
     """The given weekday (Mon=0 .. Sun=6) falling on or after `ref` (default today)."""
@@ -111,8 +151,11 @@ def fetch_projects():
 
 def collect_work_project_ids(projects):
     """Return IDs of the #work project and all its sub-projects (any depth)."""
-    root_ids = {p["id"] for p in projects if p.get("name", "").lower() == "work"}
+    root_ids = {p["id"] for p in projects if p.get("name", "").lower() == WORK_PROJECT.lower()}
     if not root_ids:
+        config_errors.append(
+            f"no project named #{WORK_PROJECT} exists, so work tasks were not kept off "
+            f"the weekend (rename it back, or set WORK_PROJECT)")
         return set()
     all_ids = set(root_ids)
     frontier = set(root_ids)
@@ -159,7 +202,20 @@ def fetch_tasks(query):
             break
     return out
 
+# A filter query returns every task in every project you can see, including ones a
+# collaborator has been assigned in a shared project. Rolling those would change someone
+# else's due date from this account, so they are dropped before anything is considered:
+# only tasks with no assignee, or assigned to us, are ours to move.
+def is_ours(task):
+    uid = task.get("responsible_uid")
+    return uid is None or (MY_UID is not None and str(uid) == MY_UID)
+
 overdue_tasks = fetch_tasks("overdue")
+assigned_elsewhere = len(overdue_tasks)
+overdue_tasks = [t for t in overdue_tasks if is_ours(t)]
+assigned_elsewhere -= len(overdue_tasks)
+if assigned_elsewhere:
+    print(f"Leaving {assigned_elsewhere} overdue task(s) assigned to someone else alone.")
 
 # Drop tasks older than the look-back window (the due date may carry a time component,
 # e.g. "2026-01-07T19:00:00Z", so compare on the leading YYYY-MM-DD only).
@@ -185,11 +241,12 @@ def postponed(task):
 #     there is of belonging on the Backlog page.
 candidates = {t["id"]: t for t in overdue_tasks}
 for t in fetch_tasks("date:today"):
-    candidates.setdefault(t["id"], t)
+    if is_ours(t):
+        candidates.setdefault(t["id"], t)
 
 stale = [t for t in candidates.values()
          if postponed(t) > ROLLOVER_LIMIT
-         and BACKLOG_LABEL not in t.get("labels", [])
+         and not has_label(t, BACKLOG_LABEL)
          and not is_exempt(t)]
 stale_ids = {t["id"] for t in stale}
 
@@ -213,7 +270,7 @@ print(f"Found {len(tasks)} overdue task(s) to roll forward to {today_iso}.")
 # due_date alone via the REST endpoint would strip the recurrence string.
 def target_for(task):
     is_work_task = task.get("project_id") in work_project_ids
-    is_weekend_tagged = "weekend" in task.get("labels", [])
+    is_weekend_tagged = has_label(task, WEEKEND_LABEL)
     if is_work_task and today_is_weekend:
         return upcoming_monday           # keep work off the weekend
     if is_weekend_tagged and not today_is_weekend:
@@ -231,12 +288,29 @@ for task in stale:
         "args": {"id": task["id"], "labels": labels, "due": None},
     })
 
+# A due date may carry a time of day, either floating ("2026-09-24T11:00:00") or fixed to
+# UTC ("2026-03-22T11:00:00Z"). Writing back a bare date silently drops that time, which
+# takes any reminder hung off it with it, and leaves the due string still reading "at
+# 19:00". So the time is carried across, and a fixed one is moved through the account
+# timezone rather than by swapping the date in the UTC string: the stored instant means a
+# local wall-clock time, and a roll across a DST boundary would otherwise shift it an hour.
+def retarget(old_date, target_date):
+    if "T" not in (old_date or ""):
+        return target_date
+    day = datetime.date.fromisoformat(target_date)
+    clock = old_date.split("T", 1)[1]
+    if clock.endswith("Z"):
+        local = datetime.datetime.fromisoformat(old_date.replace("Z", "+00:00")).astimezone(TZ)
+        moved = local.replace(year=day.year, month=day.month, day=day.day)
+        return moved.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"{target_date}T{clock}"
+
 roll_commands = []
 for task in tasks:
     due = task.get("due") or {}
     target_date = target_for(task)
     new_due = {
-        "date": target_date,
+        "date": retarget(due.get("date"), target_date),
         "string": due.get("string", target_date),
         "is_recurring": due.get("is_recurring", False),
         "lang": due.get("lang", "en"),
@@ -249,10 +323,17 @@ for task in tasks:
         "args": {"id": task["id"], "due": new_due},
     })
 
+def finish(status=0):
+    """Report naming problems last, where they are the final thing in the log, and fail
+    the run so the wrapper logs FAILED and syslog gets an error rather than a quiet OK."""
+    for problem in config_errors:
+        print(f"CONFIG ERROR: {problem}", file=sys.stderr)
+    sys.exit(1 if config_errors else status)
+
 commands = backlog_commands + roll_commands
 if not commands:
     print("Nothing to do.")
-    sys.exit(0)
+    finish()
 
 if DRY_RUN:
     from collections import Counter
@@ -262,14 +343,14 @@ if DRY_RUN:
         for task in sorted(stale, key=lambda t: -postponed(t)):
             print(f"[dry-run]   pushed {postponed(task):4d}x  "
                   f"{due_date_of(task)}  {task['content'][:60]!r}")
-    by_target = Counter(c["args"]["due"]["date"] for c in roll_commands)
+    by_target = Counter(c["args"]["due"]["date"][:10] for c in roll_commands)
     print(f"[dry-run] would move {len(roll_commands)} task(s):")
     for tgt, n in sorted(by_target.items()):
         print(f"[dry-run]   -> {tgt}: {n} task(s)")
     for task, cmd in zip(tasks, roll_commands):
         old = (task.get("due") or {}).get("date")
         print(f"[dry-run]   {old} -> {cmd['args']['due']['date']}  {task['content'][:60]!r}")
-    sys.exit(0)
+    finish()
 
 BATCH_SIZE = 100
 sync_status = {}
@@ -305,4 +386,5 @@ if backlogged:
 print(f"Rolled forward {len(updated)} task(s): {updated}")
 if errors:
     print(f"Errors on {len(errors)} task(s): {errors}")
-    sys.exit(1)
+    finish(1)
+finish()
