@@ -8,8 +8,9 @@ today's list is ready when you wake up.
 Scheduling rules for the target day:
   * Work tasks (#work project + all sub-projects) are never scheduled onto a weekend:
     if today is Sat/Sun they roll to the upcoming Monday instead.
-  * Unprioritised @weekend tasks are kept on weekends: on a weekday they roll to the
-    upcoming Saturday rather than landing mid-week.
+  * @weekend tasks are kept on weekends: on a weekday they roll to the upcoming
+    Saturday rather than landing mid-week. The label wins regardless of priority, the
+    same way the #work rule above does.
   * A task pushed more than ROLLOVER_LIMIT times (Todoist's own postponed_count) stops
     being rolled: it gets the @backlog label and its due date cleared, which takes it off
     the today list and onto the Backlog page in todoist-triage. That is the same label
@@ -211,12 +212,11 @@ print(f"Found {len(tasks)} overdue task(s) to roll forward to {today_iso}.")
 # the date. Using the Sync API item_update is required for recurring tasks; setting a
 # due_date alone via the REST endpoint would strip the recurrence string.
 def target_for(task):
-    has_no_priority = task.get("priority", 1) == 1
     is_work_task = task.get("project_id") in work_project_ids
     is_weekend_tagged = "weekend" in task.get("labels", [])
     if is_work_task and today_is_weekend:
         return upcoming_monday           # keep work off the weekend
-    if is_weekend_tagged and has_no_priority and not today_is_weekend:
+    if is_weekend_tagged and not today_is_weekend:
         return upcoming_saturday         # keep @weekend tasks on the weekend
     return today_iso
 
