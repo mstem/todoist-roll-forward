@@ -8,8 +8,8 @@ today's list is ready when you wake up.
 Only tasks with no assignee, or assigned to this account, are touched: a filter query
 also returns tasks a collaborator has been assigned in a shared project, and those are
 theirs to reschedule. A time of day on the due date is carried across the move. Recurring
-tasks are never moved, because a task has one date field and moving it moves the whole
-series rather than the single occurrence.
+tasks are rolled too, keeping their recurrence string. A task has one date field, so the
+move shifts the whole series rather than the single occurrence (see the note in the code).
 
 Scheduling rules for the target day:
   * Work tasks (#work project + all sub-projects) are never scheduled onto a weekend:
@@ -268,16 +268,12 @@ if skipped:
 # occurrence" and the anchor the next one is computed from. Moving it therefore moves the
 # whole series: measured on a scratch task, "every week" due Sunday and rolled to the
 # Saturday came back due the following Saturday once completed, and rolled to a Wednesday
-# came back due Wednesdays. A weekly task left undone for a few days migrates across the
-# week one sweep at a time, and never migrates back. There is no way to move only the
-# occurrence, so recurring tasks are left where they are: coming back on their own is the
-# point of one, and Todoist's own Today view lists them while they are overdue.
-recurring = [t for t in tasks if (t.get("due") or {}).get("is_recurring")]
-if recurring:
-    recurring_ids = {t["id"] for t in recurring}
-    tasks = [t for t in tasks if t["id"] not in recurring_ids]
-    print(f"Leaving {len(recurring)} recurring task(s) where they are; moving one would "
-          f"move every future occurrence with it.")
+# came back due Wednesdays. There is no way to move only the occurrence. Recurring tasks
+# are rolled anyway, because an undone occurrence left on a past day drops off the today
+# list this sweep exists to keep complete, and that costs more than the drift.
+recurring_count = sum(1 for t in tasks if (t.get("due") or {}).get("is_recurring"))
+if recurring_count:
+    print(f"Rolling {recurring_count} recurring task(s) too; each one's series moves with it.")
 
 print(f"Found {len(tasks)} overdue task(s) to roll forward to {today_iso}.")
 
